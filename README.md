@@ -25,13 +25,21 @@ LiteLLM Proxy  ←── translates Anthropic API format to OpenAI format
 
 | Component | What it does | How it starts |
 |-----------|-------------|---------------|
-| **Ollama** | Runs Gemma locally on Apple Silicon | `brew services start ollama` (auto at login) |
+| **Ollama** | Runs Gemma locally on Apple Silicon | On-demand via `gemma-start` |
 | **Gemma 4 E4B** | The actual model weights (9.6 GB) | Loaded by Ollama on demand |
-| **LiteLLM Proxy** | Bridges Claude Code → Ollama | launchd agent (auto at login) |
+| **LiteLLM Proxy** | Bridges Claude Code → Ollama | On-demand via `gemma-start` |
 
-Shell aliases added to `~/.zshrc`:
-- `claude-gemma` — Claude Code using Gemma 4 E4B
-- `gemma-proxy-status` — check if everything is running
+> **Neither Ollama nor the proxy auto-start at login.** This keeps the system cool and memory free until you actually need Gemma.
+
+Shell functions/aliases in `~/.zshrc`:
+
+| Command | What it does |
+|---------|-------------|
+| `gemma-start` | Start Ollama + LiteLLM proxy |
+| `gemma-stop` | Stop both — use when done or system is hot |
+| `gemma-proxy-status` | Check if everything is running |
+| `claude-gemma` | Open Claude Code using Gemma 4 E4B |
+| `claude` | Normal Claude Code (Anthropic, unchanged) |
 
 ---
 
@@ -39,13 +47,13 @@ Shell aliases added to `~/.zshrc`:
 
 ### Hardware
 
-| Resource | Minimum | Your Mac |
-|----------|---------|----------|
-| **RAM** | 6 GB free | 8 GB total (M1) |
-| **Disk** | 12 GB free | 460 GB (20 GB free at setup) |
-| **CPU/GPU** | Apple Silicon preferred | M1 ✓ |
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| **RAM** | 6 GB free | 16 GB total (M2/M3) |
+| **Disk** | 12 GB free | 20 GB+ free |
+| **CPU/GPU** | Apple Silicon preferred | M2 Pro or better |
 
-> **Note:** On M1 with 8 GB RAM, Gemma 4 E4B uses unified memory. Expect ~5–6 GB consumed while the model is loaded. Other apps may become sluggish. M2/M3 with 16 GB is the comfortable sweet spot.
+> **On M1 with 8 GB RAM:** Gemma consumes ~5–6 GB of unified memory while loaded. Other apps will become sluggish. Always run `gemma-stop` when done. M2/M3 with 16 GB is the comfortable sweet spot.
 
 ### Software Prerequisites
 
@@ -57,7 +65,7 @@ Shell aliases added to `~/.zshrc`:
 | Claude Code CLI | Latest | `npm install -g @anthropic-ai/claude-code` |
 | Ollama | 0.23+ | via Homebrew (below) |
 
-> **Why Python 3.13 specifically?** LiteLLM's dependency `orjson` does not yet support Python 3.14 (the current Homebrew default). Use 3.13 explicitly.
+> **Why Python 3.13 specifically?** LiteLLM's dependency `orjson` does not yet support Python 3.14 (the current Homebrew default as of May 2026). Use 3.13 explicitly.
 
 ---
 
@@ -69,6 +77,8 @@ Run these in order. Each step builds on the previous one.
 
 ```bash
 brew install ollama
+
+# Start it temporarily just for the model download
 brew services start ollama
 
 # Verify it's running
@@ -83,7 +93,7 @@ This is a 9.6 GB download. Make sure you have at least 12 GB free first.
 # Check free space before starting
 df -h /
 
-# Pull the model (Ollama resumes if interrupted)
+# Pull the model (Ollama resumes automatically if interrupted)
 ollama pull gemma4:e4b
 
 # Confirm it's installed
@@ -94,6 +104,11 @@ Expected output:
 ```
 NAME          ID              SIZE      MODIFIED
 gemma4:e4b    c6eb396dbd59    9.6 GB    just now
+```
+
+Once downloaded, stop the service — you'll start it on-demand from now on:
+```bash
+brew services stop ollama
 ```
 
 ### Step 3 — Install LiteLLM in a Python 3.13 Virtual Environment
@@ -113,7 +128,7 @@ cat > ~/.litellm-config.yaml << 'EOF'
 model_list:
   - model_name: gemma4-e4b
     litellm_params:
-      model: ollama/gemma4:e4b
+      model: ollama/gemma4-cc
       api_base: http://localhost:11434
 
   - model_name: claude-sonnet
@@ -129,9 +144,11 @@ general_settings: {}
 EOF
 ```
 
-### Step 5 — Create the launchd Auto-Start Agent
+> Note: the model name is `gemma4-cc`, not `gemma4:e4b` — this is a custom model created in Step 5b that fixes JSON-wrapped responses.
 
-This makes the proxy start automatically at every login.
+### Step 5 — Create the launchd Agent (On-Demand, Not Auto-Start)
+
+The plist file is used for easy start/stop control but **does not auto-start at login** (`RunAtLoad` and `KeepAlive` are both `false`).
 
 ```bash
 cat > ~/Library/LaunchAgents/com.litellm.proxy.plist << 'EOF'
@@ -150,9 +167,9 @@ cat > ~/Library/LaunchAgents/com.litellm.proxy.plist << 'EOF'
         <string>4000</string>
     </array>
     <key>RunAtLoad</key>
-    <true/>
+    <false/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
     <key>StandardOutPath</key>
     <string>/tmp/litellm-proxy.log</string>
     <key>StandardErrorPath</key>
@@ -163,30 +180,64 @@ EOF
 
 # Replace YOUR_USERNAME with your actual username
 sed -i '' "s/YOUR_USERNAME/$(whoami)/g" ~/Library/LaunchAgents/com.litellm.proxy.plist
-
-# Load it
-launchctl load ~/Library/LaunchAgents/com.litellm.proxy.plist
 ```
 
-### Step 6 — Add Shell Aliases
+### Step 5b — Fix JSON-Wrapped Responses (Required)
+
+Out of the box, Gemma 4 E4B wraps its replies in JSON like `{"response": "..."}` instead of plain text. Fix this by creating a custom Ollama model with a system prompt that instructs it to respond naturally:
+
+```bash
+cat > /tmp/gemma4-cc.modelfile << 'EOF'
+FROM gemma4:e4b
+SYSTEM "You are a helpful AI coding assistant. Always respond in plain, natural language. Never wrap your responses in JSON, never use keys like 'response:' or structured output unless the user explicitly asks for it."
+EOF
+
+ollama create gemma4-cc -f /tmp/gemma4-cc.modelfile
+```
+
+> This creates a thin wrapper model called `gemma4-cc` (same weights, just with a fixed system prompt). The LiteLLM config already references this name. If you ever need to reset it, just re-run the `ollama create` command.
+
+After creating, stop Ollama again:
+```bash
+brew services stop ollama
+```
+
+### Step 6 — Add Shell Functions
 
 Add these to your `~/.zshrc`:
 
 ```bash
 cat >> ~/.zshrc << 'EOF'
 
-# Gemma 4 E4B via LiteLLM proxy — model switching helpers
-alias claude-gemma='ANTHROPIC_BASE_URL=http://localhost:4000 ANTHROPIC_API_KEY=sk-no-key claude --model gemma4-e4b'
-alias claude-sonnet='claude'
+# Gemma 4 E4B — on-demand start/stop (does NOT auto-start at login)
+gemma-start() {
+  echo "Starting Ollama..."
+  brew services start ollama
+  echo "Starting LiteLLM proxy..."
+  launchctl load ~/Library/LaunchAgents/com.litellm.proxy.plist
+  sleep 3
+  echo "Ready. Use 'claude-gemma' to start a session."
+}
+
+gemma-stop() {
+  echo "Stopping LiteLLM proxy..."
+  launchctl unload ~/Library/LaunchAgents/com.litellm.proxy.plist
+  echo "Stopping Ollama..."
+  brew services stop ollama
+  echo "All stopped. System will cool down."
+}
 
 gemma-proxy-status() {
   if curl -s http://localhost:4000/v1/models &>/dev/null; then
     echo "LiteLLM proxy: running"
     curl -s http://localhost:4000/v1/models | python3 -m json.tool 2>/dev/null | grep '"id"' | sed 's/.*"id": "\(.*\)".*/  - \1/'
   else
-    echo "LiteLLM proxy: stopped — check /tmp/litellm-proxy.log"
+    echo "LiteLLM proxy: stopped"
   fi
 }
+
+alias claude-gemma='ANTHROPIC_BASE_URL=http://localhost:4000 ANTHROPIC_API_KEY=sk-no-key claude --model gemma4-e4b'
+alias claude-sonnet='claude'
 EOF
 
 source ~/.zshrc
@@ -195,38 +246,60 @@ source ~/.zshrc
 ### Step 7 — Verify Everything Works
 
 ```bash
-# Check proxy is up and both models are listed
+# Start everything
+gemma-start
+
+# Check proxy is up and models are listed
 gemma-proxy-status
 
-# Send a real message to Gemma
+# Send a test message — should be plain text, no JSON
 curl -s http://localhost:4000/v1/chat/completions \
   -H "Authorization: Bearer sk-no-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"gemma4-e4b","messages":[{"role":"user","content":"Say hello"}],"max_tokens":20}' \
-  | python3 -m json.tool | grep '"content"'
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])"
+```
+
+Expected output: `Hi there! How can I help you today?` — plain text, no braces, no keys.
+
+```bash
+# Stop when done testing
+gemma-stop
 ```
 
 ---
 
 ## Daily Usage
 
+### Starting a Gemma session
+
 ```bash
-# Use Gemma 4 E4B (local, free, offline)
-claude-gemma
-
-# Use Claude Sonnet (Anthropic cloud, normal)
-claude
-
-# Check proxy health
-gemma-proxy-status
-
-# Proxy logs (if something is wrong)
-tail -f /tmp/litellm-proxy.log
+gemma-start        # starts Ollama + proxy (~3 seconds)
+claude-gemma       # opens Claude Code with Gemma 4 E4B
 ```
 
-You can also switch mid-session by passing `--model` explicitly:
+### When you're done (or system gets hot)
 
 ```bash
+gemma-stop         # stops everything, frees ~5–6 GB memory
+```
+
+### Normal Claude (unchanged)
+
+```bash
+claude             # uses Anthropic API directly, no proxy involved
+```
+
+### Other useful commands
+
+```bash
+# Check if proxy is running
+gemma-proxy-status
+
+# Watch proxy logs live
+tail -f /tmp/litellm-proxy.log
+
+# Pass model inline without the alias
 ANTHROPIC_BASE_URL=http://localhost:4000 ANTHROPIC_API_KEY=sk-no-key claude --model gemma4-e4b "explain this file"
 ```
 
@@ -248,7 +321,7 @@ Many enterprise Macs block Homebrew or restrict installing into `/opt/homebrew`.
 **Workarounds:**
 - Ask IT to whitelist Homebrew, or
 - Install Ollama directly from the official `.dmg` at `ollama.com` — no Homebrew needed
-- Use the Ollama Mac app (has a menu bar icon, starts automatically)
+- Use the Ollama Mac app (has a menu bar icon for easy start/stop — ideal for enterprise)
 
 ### Problem 2 — Outbound Port Restrictions
 
@@ -263,9 +336,11 @@ If blocked, you have two options:
 - Ask IT to whitelist `registry.ollama.ai` on port 443
 - Download the model on your personal Mac and copy it to the office Mac:
   ```bash
-  # On personal Mac — package the model
-  ollama show --modelfile gemma4:e4b
+  # On personal Mac — find the model files
+  ls ~/.ollama/models/
   # Copy ~/.ollama/models/ to office Mac via USB or shared drive
+  # Then on office Mac:
+  # Place files in ~/.ollama/models/ and run: ollama list
   ```
 
 ### Problem 3 — launchd Agent May Require Admin Approval
@@ -274,11 +349,16 @@ On MDM-managed Macs (Jamf, etc.), launchd user agents in `~/Library/LaunchAgents
 
 **Alternative — start the proxy manually each session:**
 ```bash
-# Add to ~/.zshrc instead of using launchd
-nohup ~/.litellm-venv/bin/litellm --config ~/.litellm-config.yaml --port 4000 > /tmp/litellm-proxy.log 2>&1 &
+nohup ~/.litellm-venv/bin/litellm \
+  --config ~/.litellm-config.yaml \
+  --port 4000 > /tmp/litellm-proxy.log 2>&1 &
+echo "Proxy PID: $!"
 ```
 
-Or run it in a persistent terminal tab.
+Replace `gemma-start` with this command and `gemma-stop` with:
+```bash
+pkill -f "litellm.*4000" && brew services stop ollama
+```
 
 ### Problem 4 — SSL/TLS Inspection (MITM Proxy)
 
@@ -337,7 +417,10 @@ Check before starting:
 lsof -i :4000
 ```
 
-Change the port in both the plist and your aliases if needed (e.g., use `4001`).
+If occupied, change the port in `~/.litellm-config.yaml` and `~/Library/LaunchAgents/com.litellm.proxy.plist` to e.g. `4001`, then update the `claude-gemma` alias to match:
+```bash
+alias claude-gemma='ANTHROPIC_BASE_URL=http://localhost:4001 ANTHROPIC_API_KEY=sk-no-key claude --model gemma4-e4b'
+```
 
 ---
 
@@ -345,32 +428,36 @@ Change the port in both the plist and your aliases if needed (e.g., use `4001`).
 
 | File | Purpose |
 |------|---------|
-| `~/.ollama/` | Ollama model storage (9.6 GB for gemma4:e4b) |
+| `~/.ollama/models/` | Ollama model storage (9.6 GB for gemma4:e4b + gemma4-cc) |
 | `~/.litellm-config.yaml` | LiteLLM proxy model routing config |
 | `~/.litellm-venv/` | Python 3.13 virtual environment for LiteLLM |
-| `~/Library/LaunchAgents/com.litellm.proxy.plist` | Auto-start agent for LiteLLM |
-| `~/.zshrc` | Shell aliases added at the bottom |
+| `~/Library/LaunchAgents/com.litellm.proxy.plist` | On-demand launchd definition (not auto-start) |
+| `~/.zshrc` | `gemma-start`, `gemma-stop`, `gemma-proxy-status`, `claude-gemma` added at the bottom |
 
 ---
 
 ## Uninstalling / Reverting
 
 ```bash
-# Stop and remove the proxy service
-launchctl unload ~/Library/LaunchAgents/com.litellm.proxy.plist
+# Stop everything first
+gemma-stop
+
+# Remove the launchd plist
+launchctl unload ~/Library/LaunchAgents/com.litellm.proxy.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.litellm.proxy.plist
 
 # Remove LiteLLM
 rm -rf ~/.litellm-venv ~/.litellm-config.yaml
 
-# Remove Gemma model (reclaims 9.6 GB)
+# Remove Gemma models (reclaims ~9.6 GB)
+ollama rm gemma4-cc
 ollama rm gemma4:e4b
 
-# Stop Ollama service
-brew services stop ollama
+# Uninstall Ollama
+brew uninstall ollama
 
-# Remove aliases from ~/.zshrc manually
-# (the block between "# Gemma 4 E4B" comments)
+# Remove aliases — edit ~/.zshrc and delete the block starting with
+# "# Gemma 4 E4B — on-demand start/stop"
 ```
 
 ---
@@ -379,13 +466,16 @@ brew services stop ollama
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| `claude-gemma` hangs | Proxy not running | `gemma-proxy-status` then check logs |
-| `Connection refused :4000` | launchd agent failed to start | `launchctl load ~/Library/LaunchAgents/com.litellm.proxy.plist` |
-| Proxy running but Gemma slow | Model loading cold | Wait 10–15s on first prompt; warm after that |
-| `ollama pull` fails | Network/cert issue | See Enterprise Problem 2 and 4 above |
-| Mac fans spin up during inference | Normal | Gemma uses ~5–6 GB unified memory and full GPU |
-| `ModuleNotFoundError: litellm` | Wrong Python used | Use `~/.litellm-venv/bin/litellm` explicitly |
-| Responses cut off | `max_tokens` too low | Add `--max_tokens 2048` or set in LiteLLM config |
+| System running hot / fans spinning | Ollama loaded and idle | Run `gemma-stop` immediately |
+| `claude-gemma` hangs or errors | Proxy not running | Run `gemma-start`, then retry |
+| `Connection refused :4000` | Proxy failed to start | Check `tail -20 /tmp/litellm-proxy.log` |
+| Proxy running but Gemma slow to respond | Model loading cold start | Wait 10–20s on first prompt; fast after that |
+| Responses wrapped in `{"response": "..."}` | Gemma's default JSON mode | Re-run Step 5b to recreate `gemma4-cc` modelfile |
+| `ollama pull` fails | Network / cert issue | See Enterprise Problem 2 and 4 above |
+| Mac sluggish during inference | ~5–6 GB memory in use | Normal on 8 GB M1; run `gemma-stop` when done |
+| `ModuleNotFoundError: litellm` | Wrong Python version used | Use `~/.litellm-venv/bin/litellm` explicitly |
+| Responses cut off mid-sentence | `max_tokens` too low | Add `max_tokens: 2048` under `litellm_settings` in the config |
+| `gemma-start` / `gemma-stop` not found | Shell not reloaded | Run `source ~/.zshrc` first |
 
 ---
 
@@ -393,9 +483,9 @@ brew services stop ollama
 
 | Scenario | Speed |
 |----------|-------|
-| First prompt (cold load) | 10–20 seconds to first token |
-| Subsequent prompts (warm) | ~15–25 tokens/second |
-| Parallel with other apps | Slower; close memory-heavy apps |
+| First prompt (cold model load) | 10–20 seconds to first token |
+| Subsequent prompts (model warm) | ~15–25 tokens/second |
+| While other apps are open | Slower; close Chrome/Slack/Xcode if possible |
 
 For comparison, an M3 Pro with 36 GB RAM typically achieves ~60–80 tokens/second on this model.
 
