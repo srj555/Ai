@@ -214,14 +214,26 @@ gemma-start() {
   echo "Starting Ollama..."
   brew services start ollama
   echo "Starting LiteLLM proxy..."
-  launchctl load ~/Library/LaunchAgents/com.litellm.proxy.plist
-  sleep 3
-  echo "Ready. Use 'claude-gemma' to start a session."
+  nohup ~/.litellm-venv/bin/litellm \
+    --config ~/.litellm-config.yaml \
+    --port 4000 >> /tmp/litellm-proxy.log 2>&1 &
+  echo $! > /tmp/litellm-proxy.pid
+  sleep 4
+  if curl -s http://localhost:4000/v1/models &>/dev/null; then
+    echo "Ready. Use 'claude-gemma' to start a session."
+  else
+    echo "Proxy didn't start — check: tail /tmp/litellm-proxy.log"
+  fi
 }
 
 gemma-stop() {
   echo "Stopping LiteLLM proxy..."
-  launchctl unload ~/Library/LaunchAgents/com.litellm.proxy.plist
+  if [[ -f /tmp/litellm-proxy.pid ]]; then
+    kill $(cat /tmp/litellm-proxy.pid) 2>/dev/null
+    rm /tmp/litellm-proxy.pid
+  else
+    pkill -f "litellm.*4000" 2>/dev/null
+  fi
   echo "Stopping Ollama..."
   brew services stop ollama
   echo "All stopped. System will cool down."
@@ -242,6 +254,8 @@ EOF
 
 source ~/.zshrc
 ```
+
+> **Why not launchctl?** Using `launchctl load` for on-demand services throws `Input/output error` if the plist was ever previously loaded or bootstrapped in another context. Running LiteLLM directly with `nohup` is simpler — the PID is saved to `/tmp/litellm-proxy.pid` so `gemma-stop` can kill it cleanly.
 
 ### Step 7 — Verify Everything Works
 
@@ -468,6 +482,7 @@ brew uninstall ollama
 |---------|-------------|-----|
 | System running hot / fans spinning | Ollama loaded and idle | Run `gemma-stop` immediately |
 | `claude-gemma` hangs or errors | Proxy not running | Run `gemma-start`, then retry |
+| `Load failed: 5: Input/output error` | launchctl conflict with old plist state | Use `gemma-start` (updated to use `nohup` instead of launchctl) |
 | `Connection refused :4000` | Proxy failed to start | Check `tail -20 /tmp/litellm-proxy.log` |
 | Proxy running but Gemma slow to respond | Model loading cold start | Wait 10–20s on first prompt; fast after that |
 | Responses wrapped in `{"response": "..."}` | Gemma's default JSON mode | Re-run Step 5b to recreate `gemma4-cc` modelfile |
